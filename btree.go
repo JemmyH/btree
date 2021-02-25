@@ -52,7 +52,6 @@ import (
 	"io"
 	"sort"
 	"strings"
-	"sync"
 )
 
 // Item represents a single object in the tree.
@@ -73,47 +72,6 @@ var (
 	nilItems    = make(items, 16)
 	nilChildren = make(children, 16)
 )
-
-// FreeList represents a free list of btree nodes. By default each
-// BTree has its own FreeList, but multiple BTrees can share the same
-// FreeList.
-// Two Btrees using the same freelist are safe for concurrent write access.
-type FreeList struct {
-	mu       sync.Mutex
-	freelist []*node
-}
-
-// NewFreeList creates a new free list.
-// size is the maximum size of the returned free list.
-func NewFreeList(size int) *FreeList {
-	return &FreeList{freelist: make([]*node, 0, size)}
-}
-
-func (f *FreeList) newNode() (n *node) {
-	f.mu.Lock()
-	index := len(f.freelist) - 1
-	if index < 0 {
-		f.mu.Unlock()
-		return new(node)
-	}
-	n = f.freelist[index]
-	f.freelist[index] = nil
-	f.freelist = f.freelist[:index]
-	f.mu.Unlock()
-	return
-}
-
-// freeNode adds the given node to the list, returning true if it was added
-// and false if it was discarded.
-func (f *FreeList) freeNode(n *node) (out bool) {
-	f.mu.Lock()
-	if len(f.freelist) < cap(f.freelist) {
-		f.freelist = append(f.freelist, n)
-		out = true
-	}
-	f.mu.Unlock()
-	return
-}
 
 // ItemIterator allows callers of Ascend* to iterate in-order over portions of
 // the tree.  When this function returns false, iteration will stop and the
@@ -141,6 +99,14 @@ func NewWithFreeList(degree int, f *FreeList) *BTree {
 
 // items stores items in a node.
 type items []Item
+
+func (s items) String() string {
+	var a strings.Builder
+	for _, i := range s {
+		a.WriteString(fmt.Sprint(i) + " -> ")
+	}
+	return a.String()
+}
 
 // insertAt inserts a value into the given index, pushing all subsequent values
 // forward.
@@ -173,6 +139,7 @@ func (s *items) pop() (out Item) {
 
 // truncate truncates this instance at index so that it contains only the
 // first index items. index must be less than or equal to length.
+// truncate 将这个 index 后面的所有元素(包括自己)干掉
 func (s *items) truncate(index int) {
 	var toClear items
 	*s, toClear = (*s)[:index], (*s)[index:]
@@ -184,13 +151,21 @@ func (s *items) truncate(index int) {
 // find returns the index where the given item should be inserted into this
 // list.  'found' is true if the item already exists in the list at the given
 // index.
+// find 使用二分法查找 items(有序) 中是否包含某个 Item
+// sort.Search 利用二分法进行查找，返回符合条件的最左边数值的index。
+// 如果 f(i) == true，则 f(i+1) == true。
+// 非常精妙的实现了 B 树的查找！所返回的 index，要么是 found=true 时当前 items 数组中的 index，要么是 found=false 时
+// n.children 数组的 index(应该在这个 child 中继续查找)。没有了树的递归查找！
 func (s items) find(item Item) (index int, found bool) {
 	i := sort.Search(len(s), func(i int) bool {
 		return item.Less(s[i])
 	})
+	// 如果 item 比 s 中所有元素都要小，那么 i = len(s)
+	// item 在 s 中，并且 s[i] = item
 	if i > 0 && !s[i-1].Less(item) {
 		return i - 1, true
 	}
+	// item 不在 s 中，此时 i 为 item 应该插入的位置
 	return i, false
 }
 
@@ -242,11 +217,12 @@ func (s *children) truncate(index int) {
 //   * len(children) == 0, len(items) unconstrained
 //   * len(children) == len(items) + 1
 type node struct {
-	items    items
-	children children
-	cow      *copyOnWriteContext
+	items    items               // 一个 node 中的 所有结点(叶子结点就是 kv，否则就是非叶子结点的索引)
+	children children            // 子节点
+	cow      *copyOnWriteContext // 理解成 context
 }
 
+// mutableFor 寻找当前 node 的上下文对应的 node
 func (n *node) mutableFor(cow *copyOnWriteContext) *node {
 	if n.cow == cow {
 		return n
@@ -277,6 +253,7 @@ func (n *node) mutableChild(i int) *node {
 // split splits the given node at the given index.  The current node shrinks,
 // and this function returns the item that existed at that index and a new node
 // containing all items/children after it.
+// split 将 n 的 items 和 children 从 i 处分割，返回 i 处的 Item， 并将从 i 处分割后的所有的 items 和 children放在一个新的 node 返回
 func (n *node) split(i int) (Item, *node) {
 	item := n.items[i]
 	next := n.cow.newNode()
@@ -291,14 +268,15 @@ func (n *node) split(i int) (Item, *node) {
 
 // maybeSplitChild checks if a child should be split, and if so splits it.
 // Returns whether or not a split occurred.
+// maybeSplitChild 进行当前 node 的 children 的第 i 个 child 的分裂操作
 func (n *node) maybeSplitChild(i, maxItems int) bool {
 	if len(n.children[i].items) < maxItems {
 		return false
 	}
-	first := n.mutableChild(i)
-	item, second := first.split(maxItems / 2)
-	n.items.insertAt(i, item)
-	n.children.insertAt(i+1, second)
+	first := n.mutableChild(i)                // first 是 n 的第 i 个 child，类型是 node
+	item, second := first.split(maxItems / 2) // item 为 first 第(maxItems/2)个位置的 node 的Item 值，second 是 item 后面的所有 items 和 children
+	n.items.insertAt(i, item)                 // 中间值变成父节点的 items 的最后一个元素
+	n.children.insertAt(i+1, second)          // 分裂后的后半部分称为父节点的新的 child
 	return true
 }
 
@@ -306,24 +284,32 @@ func (n *node) maybeSplitChild(i, maxItems int) bool {
 // no nodes in the subtree exceed maxItems items.  Should an equivalent item be
 // be found/replaced by insert, it will be returned.
 func (n *node) insert(item Item, maxItems int) Item {
+	// 如果在当前 node 的 items 中找到了 item，直接返回
 	i, found := n.items.find(item)
 	if found {
 		out := n.items[i]
 		n.items[i] = item
 		return out
 	}
+	// 如果当前节点是叶子结点，应该将 item 插入到当前 node 的 items
 	if len(n.children) == 0 {
 		n.items.insertAt(i, item)
 		return nil
 	}
+	// 应该插入到第 i 个children
+	// 并且该 child 也成功分裂了，此时需要检查成为新的父节点的 items[i]和即将要插入的 item 的大小关系，来确定将 item 插入到分割后的前部分还是后部分
+	//   如果相同，用 item 代替 items[i]，并将 items[i] 做为 out 返回
+	//   如果 item < items[i],说明这这次分割是符合预期的，那么 item 应该被插入到分割后的前部分,即 children[i]
+	//   如果 item > items[i]，说明要插入的数大于新晋的 node，应该将 item 插入到分割后的后半部分
 	if n.maybeSplitChild(i, maxItems) {
-		inTree := n.items[i]
+		inTree := n.items[i] // 新成为父节点的 items 的 node
 		switch {
 		case item.Less(inTree):
 			// no change, we want first split node
 		case inTree.Less(item):
 			i++ // we want second split node
 		default:
+			// item equals to inTree。做一个替换，将 tree 中原来的作为 out 返回出去，树中该位置由新的 item 代替
 			out := n.items[i]
 			n.items[i] = item
 			return out
@@ -333,8 +319,9 @@ func (n *node) insert(item Item, maxItems int) Item {
 }
 
 // get finds the given key in the subtree and returns it.
+// btree 的查找。先在当前 node 的 items 中找，如果没有就去 children 中递归查找
 func (n *node) get(key Item) Item {
-	i, found := n.items.find(key)
+	i, found := n.items.find(key) // 先在当前节点找
 	if found {
 		return n.items[i]
 	} else if len(n.children) > 0 {
@@ -381,7 +368,7 @@ const (
 )
 
 // remove removes an item from the subtree rooted at this node.
-func (n *node) remove(item Item, minItems int, typ toRemove) Item {
+func (n *node) remove(item Item /*即将要删除的 Item*/, minItems int /*len(n.items) 必须大于这个数*/, typ toRemove) Item {
 	var i int
 	var found bool
 	switch typ {
@@ -397,23 +384,30 @@ func (n *node) remove(item Item, minItems int, typ toRemove) Item {
 		i = 0
 	case removeItem:
 		i, found = n.items.find(item)
+		// 所返回的 index，要么是 found=true 时当前 items 数组中的 index，要么是 found=false 时
+		// n.children 数组的 index(应该在这个 child 中继续查找)。
 		if len(n.children) == 0 {
+			// 没有子节点，并且 item 存在于当前的 items 中，放心删除
 			if found {
 				return n.items.removeAt(i)
 			}
+			// 不存在，无事发生
 			return nil
 		}
 	default:
 		panic("invalid type")
 	}
 	// If we get to here, we have children.
+	// 并且 item 位于 n.children[i] 中
 	if len(n.children[i].items) <= minItems {
+		// 如果这个 child 的 items 数量已经到达最小阈值了，就会触发 “合并->删除”
 		return n.growChildAndRemove(i, item, minItems, typ)
 	}
 	child := n.mutableChild(i)
 	// Either we had enough items to begin with, or we've done some
 	// merging/stealing, because we've got enough now and we're ready to return
 	// stuff.
+	// 到这一步，对应的这个 child 中删除一个元素不会造成 items 数量小于最小阈值。可以放心删除
 	if found {
 		// The item exists at index 'i', and the child we've selected can give us a
 		// predecessor, since if we've gotten here it's got > minItems items in it.
@@ -475,9 +469,9 @@ func (n *node) growChildAndRemove(i int, item Item, minItems int, typ toRemove) 
 		}
 		child := n.mutableChild(i)
 		// merge with right child
-		mergeItem := n.items.removeAt(i)
-		mergeChild := n.children.removeAt(i + 1)
-		child.items = append(child.items, mergeItem)
+		mergeItem := n.items.removeAt(i)             // 90
+		mergeChild := n.children.removeAt(i + 1)     // 120 | 121
+		child.items = append(child.items, mergeItem) //
 		child.items = append(child.items, mergeChild.items...)
 		child.children = append(child.children, mergeChild.children...)
 		n.cow.freeNode(mergeChild)
@@ -568,10 +562,11 @@ func (n *node) iterate(dir direction, start, stop Item, includeStart bool, hit b
 }
 
 // Used for testing/debugging purposes.
-func (n *node) print(w io.Writer, level int) {
+// Print 层次遍历
+func (n *node) Print(w io.Writer, level int) {
 	fmt.Fprintf(w, "%sNODE:%v\n", strings.Repeat("  ", level), n.items)
 	for _, c := range n.children {
-		c.print(w, level+1)
+		c.Print(w, level+1)
 	}
 }
 
@@ -583,28 +578,15 @@ func (n *node) print(w io.Writer, level int) {
 // Write operations are not safe for concurrent mutation by multiple
 // goroutines, but Read operations are.
 type BTree struct {
-	degree int
-	length int
-	root   *node
-	cow    *copyOnWriteContext
+	degree int                 // 度 和 孩子结点总数都用这一个变量来代替
+	length int                 // Item 总数
+	root   *node               // root
+	cow    *copyOnWriteContext // node pool
 }
 
-// copyOnWriteContext pointers determine node ownership... a tree with a write
-// context equivalent to a node's write context is allowed to modify that node.
-// A tree whose write context does not match a node's is not allowed to modify
-// it, and must create a new, writable copy (IE: it's a Clone).
-//
-// When doing any write operation, we maintain the invariant that the current
-// node's context is equal to the context of the tree that requested the write.
-// We do this by, before we descend into any node, creating a copy with the
-// correct context if the contexts don't match.
-//
-// Since the node we're currently visiting on any write has the requesting
-// tree's context, that node is modifiable in place.  Children of that node may
-// not share context, but before we descend into them, we'll make a mutable
-// copy.
-type copyOnWriteContext struct {
-	freelist *FreeList
+// GetRoot for testing/debugging purpose
+func (t *BTree) GetRoot() *node {
+	return t.root
 }
 
 // Clone clones the btree, lazily.  Clone should not be called concurrently,
@@ -632,20 +614,16 @@ func (t *BTree) Clone() (t2 *BTree) {
 }
 
 // maxItems returns the max number of items to allow per node.
+// maxItems 返回每个 node 中最大的 Item 数量。如果大于这个数，就会触发当前节点的分裂
 func (t *BTree) maxItems() int {
 	return t.degree*2 - 1
 }
 
 // minItems returns the min number of items to allow per node (ignored for the
 // root node).
+// minItems 返回每个 node 中最少应该含有的 Item 数。如果少于这个数，就会触发父子+兄弟结点的合并
 func (t *BTree) minItems() int {
 	return t.degree - 1
-}
-
-func (c *copyOnWriteContext) newNode() (n *node) {
-	n = c.freelist.newNode()
-	n.cow = c
-	return
 }
 
 type freeType int
@@ -656,54 +634,41 @@ const (
 	ftNotOwned                     // node was ignored by COW, since it's owned by another one
 )
 
-// freeNode frees a node within a given COW context, if it's owned by that
-// context.  It returns what happened to the node (see freeType const
-// documentation).
-func (c *copyOnWriteContext) freeNode(n *node) freeType {
-	if n.cow == c {
-		// clear to allow GC
-		n.items.truncate(0)
-		n.children.truncate(0)
-		n.cow = nil
-		if c.freelist.freeNode(n) {
-			return ftStored
-		} else {
-			return ftFreelistFull
-		}
-	} else {
-		return ftNotOwned
-	}
-}
-
 // ReplaceOrInsert adds the given item to the tree.  If an item in the tree
 // already equals the given one, it is removed from the tree and returned.
 // Otherwise, nil is returned.
 //
 // nil cannot be added to the tree (will panic).
+// ReplaceOrInsert 如果 item 已经存在，返回已经存在的，并将原来的位置用 item 代替；不存在且插入成功则返回 nil
 func (t *BTree) ReplaceOrInsert(item Item) Item {
 	if item == nil {
 		panic("nil item being added to BTree")
 	}
+	// 如果 root 为空，说明还没有初始化。创建一个 root 节点
 	if t.root == nil {
-		t.root = t.cow.newNode()
-		t.root.items = append(t.root.items, item)
-		t.length++
+		t.root = t.cow.newNode()                  // 从 pool 获取一个 node
+		t.root.items = append(t.root.items, item) // 这个 node 的 items 是包含自己的
+		t.length++                                // 这个 tree 的节点数量增加 1
 		return nil
 	} else {
-		t.root = t.root.mutableFor(t.cow)
+		t.root = t.root.mutableFor(t.cow) // 确保是当前的 btree 的 root
+		// 将 b 树的分裂延迟到下一次插入，即本次插入时要检查上次插入是否造成了当前节点的分裂
 		if len(t.root.items) >= t.maxItems() {
-			item2, second := t.root.split(t.maxItems() / 2)
-			oldroot := t.root
+			// item2 为 items 最中间的 node; second 为新申请的 node(items 和 children 均为最中间的 node 后面的)
+			item2, second := t.root.split(t.maxItems() / 2) // 从中间分裂
+			oldRoot := t.root
+			// oldRoot 为原来 items 的前半部分，second 为原来 items 的后半部分。它们都会作为新 root 的 children
 			t.root = t.cow.newNode()
 			t.root.items = append(t.root.items, item2)
-			t.root.children = append(t.root.children, oldroot, second)
+			t.root.children = append(t.root.children, oldRoot, second)
 		}
 	}
 	out := t.root.insert(item, t.maxItems())
+	// 返回 nil 表示成功插入，此时 tree 的元素个数加一
 	if out == nil {
 		t.length++
 	}
-	return out
+	return out // out 表示已经存在于 tree 的 Item，如果之前不存在就是 nil
 }
 
 // Delete removes an item equal to the passed in item from the tree, returning
@@ -731,9 +696,9 @@ func (t *BTree) deleteItem(item Item, typ toRemove) Item {
 	t.root = t.root.mutableFor(t.cow)
 	out := t.root.remove(item, t.minItems(), typ)
 	if len(t.root.items) == 0 && len(t.root.children) > 0 {
-		oldroot := t.root
-		t.root = t.root.children[0]
-		t.cow.freeNode(oldroot)
+		oldRoot := t.root
+		t.root = t.root.children[0] // 父节点就一个还给删除了，所以将子节点第一个提拔代替自己
+		t.cow.freeNode(oldRoot)
 	}
 	if out != nil {
 		t.length--
